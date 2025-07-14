@@ -144,6 +144,26 @@ class BiCodec(nn.Module):
         return feats_mix
 
     @torch.no_grad()
+    def combined_codebook(self):
+        acoustic_codebook = self.speaker_encoder.quantizer.codebooks.clone()  # [1, 4096, 6]
+        semantic_codebook = self.quantizer.codebook.weight.clone()
+        acoustic_codebook = torch.nn.functional.pad(
+            acoustic_codebook[0],
+            [0, 0, 0, semantic_codebook.shape[0] - acoustic_codebook.shape[1]],
+        )
+        combined_codebook = torch.cat([acoustic_codebook, semantic_codebook], dim=-1)
+        return combined_codebook
+
+    @torch.no_grad()
+    def extract_combined_feats(self, wav):
+        feat = self.extract_wav2vec2_features(wav)
+        mel = self.mel_transformer(wav).squeeze(1)
+        z = self.encoder(feat.transpose(1, 2))
+        _, features = self.speaker_encoder.speaker_encoder(mel.transpose(1, 2), True)
+        combined_feats = torch.cat([z, features[:, :, :z.shape[-1]]], dim=1)
+        return combined_feats
+
+    @torch.no_grad()
     def tokenize(self, wav):
         """
         Tokenizes the input audio into semantic and global tokens.
@@ -225,6 +245,7 @@ if __name__ == "__main__":
     x = torch.randn(2, 1, int(duration * 16000)).cuda()
 
     # Forward pass
+    model.combined_codebook()
     semantic_tokens, global_tokens = model.tokenize(x)
     wav_recon = model.detokenize(semantic_tokens, global_tokens)
     print(wav_recon.shape)
