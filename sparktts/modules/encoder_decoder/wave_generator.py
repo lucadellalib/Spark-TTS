@@ -17,13 +17,8 @@
 
 import torch.nn as nn
 
-from sparktts.modules.blocks.layers import (
-    Snake1d,
-    WNConv1d,
-    ResidualUnit,
-    WNConvTranspose1d,
-    init_weights,
-)
+from sparktts.modules.blocks.layers import (ResidualUnit, Snake1d, WNConv1d,
+                                            WNConvTranspose1d, init_weights)
 
 
 class DecoderBlock(nn.Module):

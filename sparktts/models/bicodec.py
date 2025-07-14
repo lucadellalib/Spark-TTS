@@ -13,19 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+from typing import Any, Dict
+
 import torch
 import torch.nn as nn
-from pathlib import Path
-from typing import Dict, Any
-from omegaconf import DictConfig
 from safetensors.torch import load_file
+from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2Model
 
-from sparktts.utils.file import load_config
-from sparktts.modules.speaker.speaker_encoder import SpeakerEncoder
-from sparktts.modules.encoder_decoder.feat_encoder import Encoder
 from sparktts.modules.encoder_decoder.feat_decoder import Decoder
+from sparktts.modules.encoder_decoder.feat_encoder import Encoder
 from sparktts.modules.encoder_decoder.wave_generator import WaveGenerator
-from sparktts.modules.vq.factorized_vector_quantize import FactorizedVectorQuantize
+from sparktts.modules.speaker.speaker_encoder import SpeakerEncoder
+from sparktts.modules.vq.factorized_vector_quantize import \
+    FactorizedVectorQuantize
+from sparktts.utils.file import load_config
 
 
 class BiCodec(nn.Module):
@@ -43,7 +45,7 @@ class BiCodec(nn.Module):
         speaker_encoder: nn.Module,
         prenet: nn.Module,
         postnet: nn.Module,
-        **kwargs
+        **kwargs,
     ) -> None:
         """
         Initializes the BiCodec model with the required components.
@@ -67,18 +69,26 @@ class BiCodec(nn.Module):
         self.init_mel_transformer(mel_params)
 
     @classmethod
-    def load_from_checkpoint(cls, model_dir: Path, **kwargs) -> "BiCodec":
+    def load_from_checkpoint(
+        cls, model_dir="SparkAudio/Spark-TTS-0.5B", **kwargs
+    ) -> "BiCodec":
         """
         Loads the model from a checkpoint.
 
         Args:
             model_dir (Path): Path to the model directory containing checkpoint and config.
-        
+
         Returns:
             BiCodec: The initialized BiCodec model.
         """
-        ckpt_path = f'{model_dir}/model.safetensors'
-        config = load_config(f'{model_dir}/config.yaml')['audio_tokenizer']
+        import os
+
+        from huggingface_hub import snapshot_download
+
+        model_dir = snapshot_download(model_dir)
+        codec_dir = os.path.join(model_dir, "BiCodec")
+        ckpt_path = f"{codec_dir}/model.safetensors"
+        config = load_config(f"{codec_dir}/config.yaml")["audio_tokenizer"]
         mel_params = config["mel_params"]
         encoder = Encoder(**config["encoder"])
         quantizer = FactorizedVectorQuantize(**config["quantizer"])
@@ -100,56 +110,41 @@ class BiCodec(nn.Module):
         state_dict = load_file(ckpt_path)
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
 
-        for key in missing_keys:
-            print(f"Missing tensor: {key}")
-        for key in unexpected_keys:
-            print(f"Unexpected tensor: {key}")
+        #for key in missing_keys:
+        #    print(f"Missing tensor: {key}")
+        #for key in unexpected_keys:
+        #    print(f"Unexpected tensor: {key}")
 
-        model.eval()
         model.remove_weight_norm()
 
-        return model
+        model.processor = Wav2Vec2FeatureExtractor.from_pretrained(
+            f"{model_dir}/wav2vec2-large-xlsr-53"
+        )
+        model.feature_extractor = Wav2Vec2Model.from_pretrained(
+            f"{model_dir}/wav2vec2-large-xlsr-53"
+        )
+        model.feature_extractor.config.output_hidden_states = True
 
-    def forward(self, batch: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Performs a forward pass through the model.
+        return model.eval()
 
-        Args:
-            batch (dict): A dictionary containing features, reference waveform, and target waveform.
-        
-        Returns:
-            dict: A dictionary containing the reconstruction, features, and other metrics.
-        """
-        feat = batch["feat"]
-        mel = self.mel_transformer(batch["ref_wav"]).squeeze(1)
+    def extract_wav2vec2_features(self, wavs: torch.Tensor) -> torch.Tensor:
+        """extract wav2vec2 features"""
+        inputs = self.processor(
+            [x.numpy() for x in wavs[:, 0].cpu()],
+            sampling_rate=16000,
+            return_tensors="pt",
+            padding=True,
+            output_hidden_states=True,
+        ).input_values
+        feat = self.feature_extractor(inputs.to(self.feature_extractor.device))
+        feats_mix = (
+            feat.hidden_states[11] + feat.hidden_states[14] + feat.hidden_states[16]
+        ) / 3
 
-        z = self.encoder(feat.transpose(1, 2))
-        vq_outputs = self.quantizer(z)
-
-        x_vector, d_vector = self.speaker_encoder(mel.transpose(1, 2))
-
-        conditions = d_vector
-        with_speaker_loss = False
-
-        x = self.prenet(vq_outputs["z_q"], conditions)
-        pred_feat = self.postnet(x)
-        x = x + conditions.unsqueeze(-1)
-        wav_recon = self.decoder(x)
-
-        return {
-            "vq_loss": vq_outputs["vq_loss"],
-            "perplexity": vq_outputs["perplexity"],
-            "cluster_size": vq_outputs["active_num"],
-            "recons": wav_recon,
-            "pred_feat": pred_feat,
-            "x_vector": x_vector,
-            "d_vector": d_vector,
-            "audios": batch["wav"].unsqueeze(1),
-            "with_speaker_loss": with_speaker_loss,
-        }
+        return feats_mix
 
     @torch.no_grad()
-    def tokenize(self, batch: Dict[str, Any]):
+    def tokenize(self, wav):
         """
         Tokenizes the input audio into semantic and global tokens.
 
@@ -159,13 +154,11 @@ class BiCodec(nn.Module):
         Returns:
             tuple: Semantic tokens and global tokens.
         """
-        feat = batch["feat"]
-        mel = self.mel_transformer(batch["ref_wav"]).squeeze(1)
-
+        feat = self.extract_wav2vec2_features(wav)
+        mel = self.mel_transformer(wav).squeeze(1)
         z = self.encoder(feat.transpose(1, 2))
         semantic_tokens = self.quantizer.tokenize(z)
         global_tokens = self.speaker_encoder.tokenize(mel.transpose(1, 2))
-
         return semantic_tokens, global_tokens
 
     @torch.no_grad()
@@ -212,6 +205,7 @@ class BiCodec(nn.Module):
 
     def remove_weight_norm(self):
         """Removes weight normalization from all layers."""
+
         def _remove_weight_norm(m):
             try:
                 torch.nn.utils.remove_weight_norm(m)
@@ -223,25 +217,14 @@ class BiCodec(nn.Module):
 
 # Test the model
 if __name__ == "__main__":
-
-    config = load_config("pretrained_models/SparkTTS-0.5B/BiCodec/config.yaml")
-    model = BiCodec.load_from_checkpoint(
-        model_dir="pretrained_models/SparkTTS-0.5B/BiCodec",
-    )
+    model = BiCodec.load_from_checkpoint().cuda()
+    print(sum([x.numel() for x in model.parameters()]) / 1e6)
 
     # Generate random inputs for testing
-    duration = 0.96
-    x = torch.randn(20, 1, int(duration * 16000))
-    feat = torch.randn(20, int(duration * 50), 1024)
-    inputs = {"feat": feat, "wav": x, "ref_wav": x}
+    duration = 1
+    x = torch.randn(2, 1, int(duration * 16000)).cuda()
 
     # Forward pass
-    outputs = model(inputs)
-    semantic_tokens, global_tokens = model.tokenize(inputs)
+    semantic_tokens, global_tokens = model.tokenize(x)
     wav_recon = model.detokenize(semantic_tokens, global_tokens)
-
-    # Verify if the reconstruction matches
-    if torch.allclose(outputs["recons"].detach(), wav_recon):
-        print("Test successful")
-    else:
-        print("Test failed")
+    print(wav_recon.shape)

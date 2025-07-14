@@ -14,13 +14,13 @@
 # limitations under the License.
 
 
+from typing import List
+
 import torch
 import torch.nn as nn
 
-from typing import List
-
-from sparktts.modules.blocks.vocos import VocosBackbone
 from sparktts.modules.blocks.samper import SamplingBlock
+from sparktts.modules.blocks.vocos import VocosBackbone
 
 
 class Encoder(nn.Module):
